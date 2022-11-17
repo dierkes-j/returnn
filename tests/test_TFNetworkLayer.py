@@ -1072,6 +1072,39 @@ def test_CombineLayer_broadcast_multiple():
     assert out_v.shape == out.output.batch_shape
 
 
+def test_CombineLayer_broadcast_same_dim_diff_tag():
+  from returnn.tf.util.data import batch_dim, FeatureDim, SpatialDim
+  time_dim = SpatialDim("time")
+  input_dim = FeatureDim("input", 3)
+  feat_dim = FeatureDim("feat", 3)
+
+  template_net = TFNetwork(config=Config(), extern_data=ExternData())
+  out = CombineLayer.get_out_data_from_opts(
+    network=template_net, name="template_combine", kind="add",
+    sources=[
+      InternalLayer(name="a", network=template_net, output=Data("a", dim_tags=[batch_dim, time_dim, input_dim])),
+      InternalLayer(name="b", network=template_net, output=Data("b", dim_tags=[feat_dim])),
+    ],
+    allow_broadcast_all_sources=True)
+  assert out.dim_tags == (batch_dim, time_dim, input_dim, feat_dim)
+
+  with make_scope() as session:
+    net_dict = {
+      "p": {"class": "variable", "shape": [feat_dim], "add_batch_axis": False},
+      "output": {"class": "combine", "kind": "add", "from": ["data", "p"], "allow_broadcast_all_sources": True},
+    }
+    config = Config({
+      "extern_data": {"data": {"dim_tags": [batch_dim, time_dim, input_dim]}}})
+    network = TFNetwork(config=config)
+    network.construct_from_dict(net_dict)
+    out = network.get_default_output_layer()
+    assert out.output.dim_tags == (batch_dim, time_dim, input_dim, feat_dim)
+    feed_dict = make_feed_dict(network.extern_data, n_batch=2, n_time=5)
+    session.run(tf_compat.v1.global_variables_initializer())
+    out_v = session.run(out.output.placeholder, feed_dict=feed_dict)
+    assert out_v.shape == (2, 5, 3, 3)
+
+
 def test_CombineLayer_match_unknown():
   with make_scope() as session:
     dat1 = Data(name="undefined", shape=(None, 3))
@@ -5031,7 +5064,7 @@ def test_ScatterNdLayer_RangeLayer():
           "out_type": {"shape": (), "dtype": "int32"}},  # (B,)
     "range": {"class": "range", "limit": n_ts, "out_spatial_dim": ts_dim},  # (Ts,)
     "add_t": {"class": "combine", "kind": "add", "from": ["t", "range"], "out_shape": {batch_dim, ts_dim}},  # (B,Ts)
-    "t_rel_var": {"class": "variable", "shape": (n_ts, n_out), "init": "glorot_uniform"},  # (B,Ts,D)
+    "t_rel_var": {"class": "variable", "shape": (ts_dim, n_out), "init": "glorot_uniform"},  # (B,Ts,D)
     "output": {"class": "scatter_nd", "from": "t_rel_var", "position": "add_t", "position_axis": ts_dim,
                "output_dim_via_time_from": "data", "filter_invalid_indices": True}
   }
@@ -5047,7 +5080,7 @@ def test_ScatterNdLayer_RangeLayer():
     assert out_layer.output.feature_dim_axis_or_unspecified is NotSpecified and out_layer.output.feature_dim_axis == 2
     assert out_layer.output.time_dim_axis == 1
 
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     info, out = session.run(
       (fetches, out_layer.output.placeholder),
       feed_dict={
@@ -5279,7 +5312,7 @@ def test_ScatterNdLayer_RangeLayer_RangeInAxisLayer():
     assert out_layer.output.feature_dim_axis_or_unspecified is NotSpecified and out_layer.output.feature_dim_axis == 2
     assert out_layer.output.time_dim_axis == 0
 
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     info, out = session.run(
       (fetches, out_layer.output.placeholder),
       feed_dict={
@@ -6138,6 +6171,25 @@ def test_GatherLayer_broadcast_dim():
   })
 
 
+def test_GatherLayer_different_static_dims():
+  # https://github.com/rwth-i6/returnn/issues/1219
+  from returnn.tf.util.data import batch_dim
+  head_dim = SpatialDim("head", 2)
+  round_dim = SpatialDim("round", 2)
+  chunk_dim = SpatialDim("chunk")
+  time_dim = SpatialDim("time")
+  config = Config({"extern_data": {
+    "source": {"dim_tags": [batch_dim, head_dim, time_dim]},
+    "position": {"dim_tags": [batch_dim, round_dim, chunk_dim], "dtype": "int32"}},
+    "debug_print_layer_output_template": True})
+  net = TFNetwork(config=config)
+  net.construct_from_dict({
+    "output": {
+      'class': 'gather', 'from': 'data:source', 'position': 'data:position', 'axis': time_dim,
+      'out_shape': {batch_dim, head_dim, round_dim, chunk_dim}}
+  })
+
+
 def test_SliceNdLayer():
   n_batch = 5
   n_time = 7
@@ -6807,8 +6859,6 @@ def test_ConvLayer_empty_out():
 
 
 def test_ConvLayer_stride_dilation():
-  import numpy as np
-  import torch
   with make_scope() as session:
     net = TFNetwork(config=Config({"extern_data": {"data": {"dim": 5}}}))
     net.construct_from_dict({
@@ -6817,27 +6867,24 @@ def test_ConvLayer_stride_dilation():
         "filter_size": (2,), "strides": (2,), "dilation_rate": (2,),
         "padding": "valid", "from": "data", "forward_weights_init": 1.0},
     })
-    input = np.random.randint(low=0, high=10, size=(3, 20, 5))
+    input = numpy.random.randint(low=0, high=10, size=(3, 20, 5))
     out_ = net.layers["output"].output.copy_as_batch_spatial_major()
     print(out_)
     net.initialize_params(session)
     out, seq_lens = session.run(
       [out_.placeholder, out_.size_placeholder[0]],
       feed_dict={
-        net.extern_data.data["data"].size_placeholder[0]: np.array([20, 18, 17]),
+        net.extern_data.data["data"].size_placeholder[0]: numpy.array([20, 18, 17]),
         net.extern_data.data["data"].placeholder: input,
       }
     )
-    torch_input = torch.Tensor(input)
-    conv_weight = torch.ones(7, 5, 2)
-    torch_out = torch.nn.functional.conv1d(
-      torch_input.transpose(1,2), conv_weight, bias=None, stride=2, padding=0, dilation=2
-    ).transpose(1,2).numpy()
     print(out.shape)
     print(seq_lens)
     assert isinstance(out, numpy.ndarray)
     assert isinstance(seq_lens, numpy.ndarray)
-    assert (torch_out == out).all()
+    assert out.shape == (3, 9, 7)
+    assert (seq_lens == [9, 8, 8]).all()
+
 
 def test_pool_layer_NCHW():
   with make_scope() as session:
@@ -8628,7 +8675,7 @@ def test_SyntheticGradientLayer():
     n_time = 11
     rnd = numpy.random.RandomState(42)
     with tf_compat.v1.Session() as session:
-      session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+      session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
       for step in range(5):
         info, _ = session.run(
           (fetches, update_op),
@@ -8693,7 +8740,7 @@ def test_TikhonovRegularizationLayer():
     n_time = 11
     rnd = numpy.random.RandomState(42)
     with tf_compat.v1.Session() as session:
-      session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+      session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
       for step in range(5):
         info, _ = session.run(
           (fetches, update_op),
@@ -8822,7 +8869,7 @@ def test_extra1():
     assert len(params) == 2  # W + b
 
     feed_dict = make_feed_dict(network.extern_data)
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     out1 = session.run(network.layers["output1"].output.placeholder, feed_dict=feed_dict)
     out2 = session.run(network.layers["output2"].output.placeholder, feed_dict=feed_dict)
     out3 = session.run(network.layers["output3"].output.placeholder, feed_dict=feed_dict)
@@ -8873,7 +8920,7 @@ def test_extra_subnet():
     assert len(params) == 4
 
     feed_dict = make_feed_dict(network.extern_data)
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     in_ = feed_dict[network.extern_data.data["data"].placeholder]
     sub1_out1 = session.run(network.layers["sub1_output1"].output.placeholder, feed_dict=feed_dict)
     sub1_out2 = session.run(network.layers["sub1_output2"].output.placeholder, feed_dict=feed_dict)
@@ -9067,7 +9114,7 @@ def test_extra_search():
     fetches = network.get_fetches_dict()
     data_input = network.extern_data.data["data"]
 
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     info, out = session.run(
       (fetches, layer_output.output.placeholder),
       feed_dict={

@@ -5708,6 +5708,10 @@ def test_reclayer_att_weights_output_layer():
     },
   }})
 
+  att_heads = Dim(kind=Dim.Types.Spatial, description="att_heads", dimension=1)
+  att_t = Dim(kind=Dim.Types.Spatial, description="att_t")
+  label_axis = Dim(kind=Dim.Types.Spatial, description="label-axis")
+
   net_dict = {
     "encoder": {"class": "copy", "from": "data"},
     "existing_alignment": {"class": "copy", "from": "data:alignment"},
@@ -5762,9 +5766,7 @@ def test_reclayer_att_weights_output_layer():
           "from": "att_energy0",
           "is_output_layer": False,
           "set_dim_tags": {
-            "f": Dim(
-              kind=Dim.Types.Spatial, description="att_heads", dimension=1
-            )
+            "f": att_heads
           },
         },
         "att_energy0": {
@@ -5794,9 +5796,7 @@ def test_reclayer_att_weights_output_layer():
           "class": "reinterpret_data",
           "from": "att_val_split0",
           "set_dim_tags": {
-            "dim:1": Dim(
-              kind=Dim.Types.Spatial, description="att_heads", dimension=1
-            )
+            "dim:1": att_heads
           },
         },
         "att_val_split0": {
@@ -5858,9 +5858,7 @@ def test_reclayer_att_weights_output_layer():
           "class": "reinterpret_data",
           "from": "segments0",
           "set_dim_tags": {
-            "stag:sliced-time:segments": Dim(
-              kind=Dim.Types.Spatial, description="att_t"
-            )
+            "stag:sliced-time:segments": att_t
           },
         },
         "segments0": {
@@ -5931,7 +5929,7 @@ def test_reclayer_att_weights_output_layer():
       "class": "masked_computation",
       "from": "output/segment_lens",
       "mask": "is_label",
-      "out_spatial_dim": Dim(kind=Dim.Types.Spatial, description="label-axis"),
+      "out_spatial_dim": label_axis,
       "register_as_extern_data": "segment_lens_masked",
       "unit": {"class": "copy", "from": "data"},
     },
@@ -5939,7 +5937,7 @@ def test_reclayer_att_weights_output_layer():
       "class": "masked_computation",
       "from": "output/segment_starts",
       "mask": "is_label",
-      "out_spatial_dim": Dim(kind=Dim.Types.Spatial, description="label-axis"),
+      "out_spatial_dim": label_axis,
       "register_as_extern_data": "segment_starts_masked",
       "unit": {"class": "copy", "from": "data"},
     },
@@ -7015,8 +7013,8 @@ def test_GenericAttentionLayer_extra_spatial_multi_head():
   net = TFNetwork(extern_data=ExternData(), config=Config({"debug_print_layer_output_template": True}))
   dec_time = SpatialDim("dec time")
   enc_time = SpatialDim("enc time")
-  num_heads = 8
-  heads_dim = FeatureDim("heads", dimension=num_heads)
+  heads_dim = FeatureDim("heads", dimension=8)
+  feat_dim = FeatureDim("feat", dimension=2048)
   kwargs = dict(
     name="att", network=net,
     weights=InternalLayer(
@@ -7026,14 +7024,13 @@ def test_GenericAttentionLayer_extra_spatial_multi_head():
     base=InternalLayer(
       name="enc_value", network=net,
       output=Data(
-        name='enc_value_output', shape=(None, num_heads, 2048), batch_dim_axis=1, auto_create_placeholders=True,
-        same_dim_tags_as={"t": enc_time})))
+        name='enc_value_output', dim_tags=[enc_time, batch_dim, heads_dim, feat_dim], auto_create_placeholders=True)))
   print("GenericAttentionLayer kwargs:")
   pprint(kwargs)
   kwargs["output"] = GenericAttentionLayer.get_out_data_from_opts(**kwargs)
   layer = GenericAttentionLayer(**kwargs)
   layer.output.sanity_check()
-  assert layer.output.shape == (num_heads, None, 2048) and layer.output.have_time_axis()
+  assert layer.output.shape == (heads_dim.dimension, None, feat_dim.dimension) and layer.output.have_time_axis()
   assert len(layer.output.size_placeholder) == 1
   assert list(layer.output.size_placeholder.values())[0] is layer.weights.output.size_placeholder[0]
 
@@ -8479,7 +8476,7 @@ def test_extra_scatter_nd_search_train():
       "unit": {
         "s_transformed": {"class": "linear", "activation": None, "with_bias": False, "from": ["s"],
                           "n_out": EncKeyTotalDim},
-        "t_rel_var": {"class": "variable", "shape": (6, EncKeyTotalDim)},
+        "t_rel_var": {"class": "variable", "shape": (t_rel_idxs_dim, EncKeyTotalDim)},
         "t_rel_idxs_": {"class": "range", "limit": 6, "out_spatial_dim": t_rel_idxs_dim},
         "prev_t_": {"class": "reinterpret_data", "set_sparse": False, "from": "prev:t"},
         "t_rel_idxs": {"class": "combine", "kind": "add", "from": ["prev_t_", "t_rel_idxs_"],
@@ -8596,7 +8593,7 @@ def test_extra_scatter_nd_search_train():
     assert isinstance(train3_out_layer_cell, _SubnetworkRecCell)
     assert not train3_out_layer_cell.layers_in_loop, "all should be moved out"
 
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     outputs = [train1_search_out.placeholder, train1_out.placeholder,
                train2_search_out.placeholder, train2_out.placeholder, train3_out.placeholder]
     info, out = session.run(
@@ -8750,7 +8747,7 @@ def test_trafo_search_lm():
     print(input_seqs)
     print("lens:", input_seq_lens)
 
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     fetches = (fetches, output_out.placeholder, output_out.get_sequence_lengths())
     feed_dict = {
       network.extern_data.get_batch_info().dim: len(input_seq_lens),
@@ -8840,7 +8837,7 @@ def test_self_att_rec_state():
     print(input_seqs)
     print("lens:", input_seq_lens)
 
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     fetches = (output_out.placeholder, output_out.get_sequence_lengths())
     feed_dict = {
       network.extern_data.get_batch_info().dim: len(input_seq_lens),
@@ -8921,7 +8918,7 @@ def test_generalized_non_rec_self_attention():
     assert new_dim in net.get_layer("v_").output.dim_tags
     assert set(net.get_layer("energy").output.dim_tags).issuperset({new_dim, time_dim})
     assert time_dim in net.get_layer("att").output.dim_tags
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [net.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [net.global_train_step_var]))
     from test_TFNetworkLayer import make_feed_dict
     feed_dict = make_feed_dict(net.extern_data)
     out_old_data = net.get_layer("att_old").output
@@ -9013,7 +9010,7 @@ def test_cumulated_attention_weights_search():
       print(input_seqs)
       print("lens:", input_seq_lens)
 
-      session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+      session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
       fetches = (fetches, output_out.placeholder, output_out.get_sequence_lengths())
       feed_dict = {
         network.extern_data.get_batch_info().dim: len(input_seq_lens),
@@ -9065,7 +9062,7 @@ def test_PositionalEncodingLayer_offset_no_rec():
     assert data_input.batch_shape == (None, None)
 
     train_out = network.get_layer("output").output
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     rand_data = rnd.randint(0, n_out, size=(n_batch, n_time,), dtype="int32")
     outputs = [train_out.placeholder]
     info, out = session.run(
@@ -9137,7 +9134,7 @@ def test_PositionalEncodingLayer_offset_in_rec():
     assert data_input.batch_shape == (None, None)
 
     train_out = network.get_layer("output").output
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     rand_data = rnd.randint(0, n_out, size=(n_batch, n_time,), dtype="int32")
     outputs = [train_out.placeholder]
     info, out = session.run(
@@ -9186,7 +9183,7 @@ def test_RelativePositionalEncodingLayer():
     data_input = network.extern_data.data["data"]
     assert data_input.batch_shape == (None, None, n_out)
     train_out = network.get_layer("output").output
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     rand_data = rnd.rand(n_batch, n_time, n_out)
     outputs = [train_out.placeholder]
     info, out = session.run(
@@ -9400,7 +9397,7 @@ def test_CumConcatLayer_search():
     print(input_seqs)
     print("lens:", input_seq_lens)
 
-    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step]))
+    session.run(tf_compat.v1.variables_initializer(tf_compat.v1.global_variables() + [network.global_train_step_var]))
     fetches = (fetches, output_out.placeholder, output_out.get_sequence_lengths())
     feed_dict = {
       network.extern_data.get_batch_info().dim: len(input_seq_lens),

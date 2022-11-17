@@ -22,6 +22,34 @@ and not listing legacy/deprecated parameters.
 Version History
 ---------------
 
+Behavior version 16 (2022-11-11)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``Dim.is_equal`` is more restrictive and does not give equality
+for different user-generated tags,
+or also when comparing user-generated to auto-generated tags.
+This should rarely have an effect for you.
+It might break when you mix ``n_out`` and then later also have a different
+own dim tag for the same dim.
+In that case, they will not match because the tag is different.
+In such cases, just make use of dim tags consistently, i.e. use ``out_dim``,
+or specify the dim tag directly in a shape.
+
+See issue `#865 <https://github.com/rwth-i6/returnn/issues/865>`__
+and issue `#1219 <https://github.com/rwth-i6/returnn/issues/1219>`__.
+
+Behavior version 15 (2022-11-08)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``TFNetwork.global_train_step`` should deterministically
+always return the initial value of the current step.
+Before, it could non-deterministically return the current step or the next step.
+This has an influence on any code which makes use of it.
+The biggest effect is on gradient accumulation
+where the old non-deterministic behavior likely was wrong.
+
+See issue `#1205 <https://github.com/rwth-i6/returnn/issues/1205>`__.
+
 Behavior version 14 (2022-10-19)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

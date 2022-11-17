@@ -126,6 +126,8 @@ class Dim(object):
     self._undefined = undefined
     self.generic = generic
     self.special = special
+    if derived_from_tag:
+      auto_generated = derived_from_tag.auto_generated
     self.auto_generated = auto_generated
     # We can have different tag variants per batch info (e.g. with beam), or per control flow ctx.
     # They each have same_as = self. The same_base should have the base (global) batch info.
@@ -760,6 +762,7 @@ class Dim(object):
     :param bool derived_matches:
     :rtype: bool
     """
+    from returnn.util import BehaviorVersion
     if self is other:  # first some fast path check
       return True
     if self.special or other.special:
@@ -806,6 +809,16 @@ class Dim(object):
       # or when we used MergeDimsLayer on the batch axis, or so.
       # We might need to extend the logic here later.
       return True
+    if BehaviorVersion.get() >= 16:
+      # Either self or other is some dim tag explicitly created by the user,
+      # and they are not the same, so we never treat them as equal.
+      if not self.auto_generated or not other.auto_generated:
+        if broadcast_matches and (
+              (self.dimension == 1 and self.auto_generated) or
+              (other.dimension == 1 and other.auto_generated)):
+          pass  # exception, allow broadcast logic
+        else:
+          return False
     if self_kind == other_kind == self.Types.Feature:
       if allow_same_feature_dim:
         return True
@@ -1059,6 +1072,7 @@ class Dim(object):
       other_same_base._vocab = self._vocab
     elif other_same_base._vocab and not self._vocab:
       self._vocab = other_same_base._vocab
+    self.auto_generated = self_same_as.auto_generated = other_same_base.auto_generated
     # Take over derived_from_op. However, only if this would not introduce cycles!
     if not self_derived_bases.issuperset(other_derived_bases):
       if self.derived_from_op and not other_same_base.derived_from_op:
@@ -3136,7 +3150,7 @@ class Data(object):
             "Dim %s multiple times in out_shape" % dim)
         raise VerifyOutShapeException(
           "%s verify_out_shape:\n" % self +
-          "Actual dims: %s\nExpected out_shape: %s" % (actual_dims_str, expected_dims_str) +
+          "Actual dims: %s\nExpected out_shape: %s\n" % (actual_dims_str, expected_dims_str) +
           "Dim %s not in self" % dim)
       remaining.discard(dim_tag)
     if remaining:
@@ -5608,8 +5622,8 @@ class Data(object):
             other_axes, other, self, other_axis, opt)
         if matching:
           break
-      assert matching, 'cannot match the axes %s from %s to %s. Failing at axis %s' % (
-        other_axes, other, self, other_axis)
+      assert matching, 'cannot match the axes %s from %s to %s. Failing at axis %s, tag %s' % (
+        other_axes, other, self, other_axis, other.dim_tags[other_axis])
       # If there are multiple matches (e.g. because two axes have the same feature dim), leave their order intact.
       # We do this by always choosing the first unused match which is the smallest axes
       return matching[0]
@@ -5859,7 +5873,8 @@ def _infer_dim_tags_tuple_from_shape(
           description="%s:var:extern_data:%s" % (tag_name, name),
           # Spatial dim tag, even if axis == feature_dim_axis. This is to keep the old behavior.
           # This is such that Dim.is_equal behaves as before, e.g. in Data.get_common_data.
-          kind=Dim.Types.Spatial)
+          kind=Dim.Types.Spatial,
+          auto_generated=True)
         dim_tags[axis] = tag
       dyn_size = tag.dyn_size
     if tag:

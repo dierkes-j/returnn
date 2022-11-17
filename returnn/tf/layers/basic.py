@@ -475,10 +475,12 @@ class ScaledGradientLayer(CopyLayer):
   """
   layer_class = "scaled_grad"
 
-  def __init__(self, scale, shift=None, **kwargs):
+  def __init__(self, scale, shift=None, clip_max_axis=None, **kwargs):
     """
     :param float|LayerBase scale: if 0. and no shift, will use tf.stop_gradient
     :param float|LayerBase|None shift:
+    :param Dim|str|None clip_max_axis: if given, clips the gradient to the max value in this axis
+      before the transformation, for all values in the axis
     """
     super(ScaledGradientLayer, self).__init__(**kwargs)
     self.scale = scale
@@ -489,7 +491,10 @@ class ScaledGradientLayer(CopyLayer):
     else:
       scale_t = scale.output.copy_compatible_to(self.output).placeholder if isinstance(scale, LayerBase) else scale
       shift_t = shift.output.copy_compatible_to(self.output).placeholder if isinstance(shift, LayerBase) else shift
-      self.output.placeholder = scaled_gradient(self.output.placeholder, scale=scale_t, shift=shift_t)
+      if clip_max_axis is not None:
+        clip_max_axis = self.output.get_axis_from_description(clip_max_axis, allow_int=False)
+      self.output.placeholder = scaled_gradient(
+        self.output.placeholder, scale=scale_t, shift=shift_t, clip_max_axis=clip_max_axis)
 
   def get_dep_layers(self):
     """
@@ -5031,11 +5036,15 @@ class ReinterpretDataLayer(_ConcatInputLayer):
       for axis, new_tag in set_dim_tags.items():
         axis_int = out.get_axis_from_description(axis)
         old_tag = out.dim_tags[axis_int]
+        if old_tag.is_dim_known() and not new_tag.is_dim_known():
+          new_tag.dimension = old_tag.dimension
         new_tag = new_tag.get_for_batch_ctx(out.batch, out.control_flow_ctx)
-        if old_tag.dyn_size_ext and not new_tag.dyn_size_ext:
-          # Copy the template so that we know about implicit dims.
-          # The sizes itself will be setup in __init__.
-          new_tag.dyn_size_ext = old_tag.dyn_size_ext.copy_template()
+        if old_tag.is_dim_known() and not new_tag.is_dim_known():
+          assert not new_tag.dyn_size_ext
+          if old_tag.dyn_size_ext:
+            # Copy the template so that we know about implicit dims.
+            # The sizes itself will be setup in __init__.
+            new_tag.dyn_size_ext = old_tag.dyn_size_ext.copy_template()
         out = out.copy_template_replace_dim_tag(axis=axis_int, new_dim_tag=new_tag)
     if set_sparse is not None:
       assert isinstance(set_sparse, bool)
@@ -5217,28 +5226,30 @@ class ConvLayer(_ConcatInputLayer):
         y = tf.squeeze(y, axis=-1 if out_batch_feature_major else -2)
         strides = strides[:-1]
         dilation_rate = dilation_rate[:-1]
+    elif max(strides) > 1 and max(dilation_rate) > 1:
+      # tf.nn.convolution does not support this, therefore resort to tf.nn.conv2d which requires some adaptations
+      squeeze_axis = None
+      if len(filter_size) == 1 and self.output.batch_dim_axis == 0:
+        if data_format == "NCW":
+          data_format = "NCHW"
+          filters = tf.expand_dims(filters, axis=0)
+          x = tf.expand_dims(x, axis=-2)
+          squeeze_axis = -2
+        else:  # we are in the case NWC
+          data_format = "NHWC"
+          filters = tf.expand_dims(filters, axis=0)
+          x = tf.expand_dims(x, axis=-3)  # data format is NHWC
+          squeeze_axis = -3
+      assert data_format in ["NCHW", "NHWC"], "not implemented otherwise"
+      y = tf_compat.v1.nn.conv2d(
+        x, data_format=data_format, filter=filters, padding=padding,
+        strides=strides, dilations=dilation_rate)
+      if squeeze_axis is not None:
+        y = tf.squeeze(y, axis=squeeze_axis)
     else:
-      if max(strides) > 1 and max(dilation_rate) > 1:
-        # tf.nn.convolution does not support this, therefore resort to tf.nn.conv2d which requires some adaptations
-        from_conv1d = False
-        if len(filter_size) == 1 and self.output.batch_dim_axis == 0:
-          from_conv1d = True
-          if data_format == "NCW":
-            data_format = "NCHW"
-            filters = tf.expand_dims(filters, axis=0)
-            x = tf.expand_dims(x, axis=-2)
-            squeeze_axis = -2
-          else:   # we are in the case NWC
-            data_format = "NHWC"
-            filters = tf.expand_dims(filters, axis=0)
-            x = tf.expand_dims(x, axis=-3) # data format is NHWC
-            squeeze_axis = -3
-        assert data_format in ["NCHW", "NHWC"], "not implemented otherwise"
-        y = tf_compat.v1.nn.conv2d(x, data_format=data_format, filter=filters, padding=padding, strides=strides, dilations=dilation_rate)
-        if from_conv1d:
-          y = tf.squeeze(y, axis=squeeze_axis)
-      else:
-        y = tf_compat.v1.nn.convolution(x, data_format=data_format, filter=filters, padding=padding, strides=strides, dilation_rate=dilation_rate)
+      y = tf_compat.v1.nn.convolution(
+        x, data_format=data_format, filter=filters, padding=padding,
+        strides=strides, dilation_rate=dilation_rate)
     if num_batch_dims > 1:
       y = tf.reshape(y, tf.concat([extended_batch_shape, tf.shape(y)[1:]], axis=0))
     # y shape is [batch] + dynamic_dims + [n_out].
